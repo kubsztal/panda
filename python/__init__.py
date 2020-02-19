@@ -23,14 +23,14 @@ BASEDIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "../")
 DEBUG = os.getenv("PANDADEBUG") is not None
 
 # *** wifi mode ***
-def build_st(target, mkfile="Makefile"):
+def build_st(target, mkfile="Makefile", clean=True):
   from panda import BASEDIR
-  cmd = 'cd %s && make -f %s clean && make -f %s %s >/dev/null' % (os.path.join(BASEDIR, "board"), mkfile, mkfile, target)
+
+  clean_cmd = "make -f %s clean" % mkfile if clean else ":"
+  cmd = 'cd %s && %s && make -f %s %s' % (os.path.join(BASEDIR, "board"), clean_cmd, mkfile, target)
   try:
     _ = subprocess.check_output(cmd, stderr=subprocess.STDOUT, shell=True)
   except subprocess.CalledProcessError:
-    #output = exception.output
-    #returncode = exception.returncode
     raise
 
 def parse_can_buffer(dat):
@@ -111,11 +111,11 @@ class Panda(object):
 
   # matches cereal.car.CarParams.SafetyModel
   SAFETY_SILENT = 0
-  SAFETY_HONDA = 1
+  SAFETY_HONDA_NIDEC = 1
   SAFETY_TOYOTA = 2
   SAFETY_ELM327 = 3
   SAFETY_GM = 4
-  SAFETY_HONDA_BOSCH = 5
+  SAFETY_HONDA_BOSCH_GIRAFFE = 5
   SAFETY_FORD = 6
   SAFETY_CADILLAC = 7
   SAFETY_HYUNDAI = 8
@@ -128,6 +128,7 @@ class Panda(object):
   SAFETY_ALLOUTPUT = 17
   SAFETY_GM_ASCM = 18
   SAFETY_NOOUTPUT = 19
+  SAFETY_HONDA_BOSCH_HARNESS = 20
 
   SERIAL_DEBUG = 0
   SERIAL_ESP = 1
@@ -346,24 +347,26 @@ class Panda(object):
   # ******************* health *******************
 
   def health(self):
-    dat = self._handle.controlRead(Panda.REQUEST_IN, 0xd2, 0, 0, 28)
-    a = struct.unpack("IIIIIIBBBBBBBBB", dat)
+    dat = self._handle.controlRead(Panda.REQUEST_IN, 0xd2, 0, 0, 41)
+    a = struct.unpack("IIIIIIIIBBBBBBBBB", dat)
     return {
       "uptime": a[0],
       "voltage": a[1],
       "current": a[2],
-      "can_send_errs": a[3],
-      "can_fwd_errs": a[4],
-      "gmlan_send_errs": a[5],
-      "ignition_line": a[6],
-      "ignition_can": a[7],
-      "controls_allowed": a[8],
-      "gas_interceptor_detected": a[9],
-      "car_harness_status": a[10],
-      "usb_power_mode": a[11],
-      "safety_mode": a[12],
-      "fault_status": a[13],
-      "power_save_enabled": a[14]
+      "can_rx_errs": a[3],
+      "can_send_errs": a[4],
+      "can_fwd_errs": a[5],
+      "gmlan_send_errs": a[6],
+      "faults": a[7],
+      "ignition_line": a[8],
+      "ignition_can": a[9],
+      "controls_allowed": a[10],
+      "gas_interceptor_detected": a[11],
+      "car_harness_status": a[12],
+      "usb_power_mode": a[13],
+      "safety_mode": a[14],
+      "fault_status": a[15],
+      "power_save_enabled": a[16]
     }
 
   # ******************* control *******************
@@ -377,6 +380,17 @@ class Panda(object):
 
   def get_version(self):
     return self._handle.controlRead(Panda.REQUEST_IN, 0xd6, 0, 0, 0x40).decode('utf8')
+
+  @staticmethod
+  def get_signature_from_firmware(fn):
+    f = open(fn, 'rb')
+    f.seek(-128, 2)  # Seek from end of file
+    return f.read(128)
+
+  def get_signature(self):
+    part_1 = self._handle.controlRead(Panda.REQUEST_IN, 0xd3, 0, 0, 0x40)
+    part_2 = self._handle.controlRead(Panda.REQUEST_IN, 0xd4, 0, 0, 0x40)
+    return bytes(part_1 + part_2)
 
   def get_type(self):
     return self._handle.controlRead(Panda.REQUEST_IN, 0xc1, 0, 0, 0x40)

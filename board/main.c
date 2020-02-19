@@ -5,10 +5,15 @@
 #include "config.h"
 #include "obj/gitversion.h"
 
+#include "main_declarations.h"
+#include "critical.h"
+
 #include "libc.h"
 #include "provision.h"
+#include "faults.h"
 
-#include "main_declarations.h"
+#include "drivers/registers.h"
+#include "drivers/interrupts.h"
 
 #include "drivers/llcan.h"
 #include "drivers/llgpio.h"
@@ -34,6 +39,29 @@
 
 #include "drivers/can.h"
 
+extern int _app_start[0xc000]; // Only first 3 sectors of size 0x4000 are used
+
+struct __attribute__((packed)) health_t {
+  uint32_t uptime_pkt;
+  uint32_t voltage_pkt;
+  uint32_t current_pkt;
+  uint32_t can_rx_errs_pkt;
+  uint32_t can_send_errs_pkt;
+  uint32_t can_fwd_errs_pkt;
+  uint32_t gmlan_send_errs_pkt;
+  uint32_t faults_pkt;
+  uint8_t ignition_line_pkt;
+  uint8_t ignition_can_pkt;
+  uint8_t controls_allowed_pkt;
+  uint8_t gas_interceptor_detected_pkt;
+  uint8_t car_harness_status_pkt;
+  uint8_t usb_power_mode_pkt;
+  uint8_t safety_mode_pkt;
+  uint8_t fault_status_pkt;
+  uint8_t power_save_enabled_pkt;
+};
+
+
 // ********************* Serial debugging *********************
 
 bool check_started(void) {
@@ -45,11 +73,14 @@ void debug_ring_callback(uart_ring *ring) {
   while (getc(ring, &rcv)) {
     (void)putc(ring, rcv);  // misra-c2012-17.7: cast to void is ok: debug function
 
-    // jump to DFU flash
-    if (rcv == 'z') {
-      enter_bootloader_mode = ENTER_BOOTLOADER_MAGIC;
-      NVIC_SystemReset();
-    }
+    // only allow bootloader entry on debug builds
+    #ifdef ALLOW_DEBUG
+      // jump to DFU flash
+      if (rcv == 'z') {
+        enter_bootloader_mode = ENTER_BOOTLOADER_MAGIC;
+        NVIC_SystemReset();
+      }
+    #endif
 
     // normal reset
     if (rcv == 'x') {
@@ -127,23 +158,8 @@ void set_safety_mode(uint16_t mode, int16_t param) {
 // ***************************** USB port *****************************
 
 int get_health_pkt(void *dat) {
-  struct __attribute__((packed)) {
-    uint32_t uptime_pkt;
-    uint32_t voltage_pkt;
-    uint32_t current_pkt;
-    uint32_t can_send_errs_pkt;
-    uint32_t can_fwd_errs_pkt;
-    uint32_t gmlan_send_errs_pkt;
-    uint8_t ignition_line_pkt;
-    uint8_t ignition_can_pkt;
-    uint8_t controls_allowed_pkt;
-    uint8_t gas_interceptor_detected_pkt;
-    uint8_t car_harness_status_pkt;
-    uint8_t usb_power_mode_pkt;
-    uint8_t safety_mode_pkt;
-    uint8_t fault_status_pkt;
-    uint8_t power_save_enabled_pkt;
-  } *health = dat;
+  COMPILE_TIME_ASSERT(sizeof(struct health_t) <= MAX_RESP_LEN);
+  struct health_t * health = (struct health_t*)dat;
 
   health->uptime_pkt = uptime_cnt;
   health->voltage_pkt = adc_get_voltage();
@@ -155,14 +171,17 @@ int get_health_pkt(void *dat) {
 
   health->controls_allowed_pkt = controls_allowed;
   health->gas_interceptor_detected_pkt = gas_interceptor_detected;
+  health->can_rx_errs_pkt = can_rx_errs;
   health->can_send_errs_pkt = can_send_errs;
   health->can_fwd_errs_pkt = can_fwd_errs;
   health->gmlan_send_errs_pkt = gmlan_send_errs;
   health->car_harness_status_pkt = car_harness_status;
   health->usb_power_mode_pkt = usb_power_mode;
   health->safety_mode_pkt = (uint8_t)(current_safety_mode);
-  health->fault_status_pkt = 0U;  // TODO: populate this field
   health->power_save_enabled_pkt = (uint8_t)(power_save_status == POWER_SAVE_STATUS_ENABLED);
+
+  health->fault_status_pkt = fault_status;
+  health->faults_pkt = faults;
 
   return sizeof(*health);
 }
@@ -275,19 +294,11 @@ int usb_cb_control_msg(USB_Setup_TypeDef *setup, uint8_t *resp, bool hardwired) 
       break;
     // **** 0xb0: set IR power
     case 0xb0:
-      if(power_save_status == POWER_SAVE_STATUS_DISABLED){
-        current_board->set_ir_power(setup->b.wValue.w);
-      } else {
-        puts("Setting IR power not allowed in power saving mode\n");
-      }
+      current_board->set_ir_power(setup->b.wValue.w);
       break;
     // **** 0xb1: set fan power
     case 0xb1:
-      if(power_save_status == POWER_SAVE_STATUS_DISABLED){
-        current_board->set_fan_power(setup->b.wValue.w);
-      } else {
-        puts("Setting fan power not allowed in power saving mode\n");
-      }
+      current_board->set_fan_power(setup->b.wValue.w);
       break;
     // **** 0xb2: get fan rpm
     case 0xb2:
@@ -351,6 +362,24 @@ int usb_cb_control_msg(USB_Setup_TypeDef *setup, uint8_t *resp, bool hardwired) 
     // **** 0xd2: get health packet
     case 0xd2:
       resp_len = get_health_pkt(resp);
+      break;
+    // **** 0xd3: get first 64 bytes of signature
+    case 0xd3:
+      {
+        resp_len = 64;
+        char * code = (char*)_app_start;
+        int code_len = _app_start[0];
+        (void)memcpy(resp, &code[code_len], resp_len);
+      }
+      break;
+    // **** 0xd4: get second 64 bytes of signature
+    case 0xd4:
+      {
+        resp_len = 64;
+        char * code = (char*)_app_start;
+        int code_len = _app_start[0];
+        (void)memcpy(resp, &code[code_len + 64], resp_len);
+      }
       break;
     // **** 0xd6: get version
     case 0xd6:
@@ -438,12 +467,6 @@ int usb_cb_control_msg(USB_Setup_TypeDef *setup, uint8_t *resp, bool hardwired) 
       if (setup->b.wValue.w < BUS_MAX) {
         can_speed[setup->b.wValue.w] = setup->b.wIndex.w;
         can_init(CAN_NUM_FROM_BUS_NUM(setup->b.wValue.w));
-      }
-      break;
-    // **** 0xdf: set long controls allowed
-    case 0xdf:
-      if (hardwired) {
-        long_controls_allowed = setup->b.wValue.w & 1U;
       }
       break;
     // **** 0xe0: uart read
@@ -636,9 +659,8 @@ void __attribute__ ((noinline)) enable_fpu(void) {
 #define EON_HEARTBEAT_IGNITION_CNT_ON 5U
 #define EON_HEARTBEAT_IGNITION_CNT_OFF 2U
 
-// called once per second
-// cppcheck-suppress unusedFunction ; used in headers not included in cppcheck
-void TIM1_BRK_TIM9_IRQHandler(void) {
+// called at 1Hz
+void TIM1_BRK_TIM9_IRQ_Handler(void) {
   if (TIM9->SR != 0) {
     can_live = pending_can_live;
 
@@ -686,6 +708,10 @@ void TIM1_BRK_TIM9_IRQHandler(void) {
       if (power_save_status != POWER_SAVE_STATUS_ENABLED) {
         set_power_save_state(POWER_SAVE_STATUS_ENABLED);
       }
+
+      // Also disable fan and IR when the heartbeat goes missing
+      current_board->set_fan_power(0U);
+      current_board->set_ir_power(0U);
     }
 
     // enter CDP mode when car starts to ensure we are charging a turned off EON
@@ -694,13 +720,32 @@ void TIM1_BRK_TIM9_IRQHandler(void) {
     }
     #endif
 
+    // check registers
+    check_registers();
+
+    // set ignition_can to false after 2s of no CAN seen
+    if (ignition_can_cnt > 2U) {
+      ignition_can = false;
+    };
+
     // on to the next one
     uptime_cnt += 1U;
+    safety_mode_cnt += 1U;
+    ignition_can_cnt += 1U;
+
+    // synchronous safety check
+    safety_tick(current_hooks);
   }
   TIM9->SR = 0;
 }
 
 int main(void) {
+  // Init interrupt table
+  init_interrupts(true);
+
+  // 1s timer
+  REGISTER_INTERRUPT(TIM1_BRK_TIM9_IRQn, TIM1_BRK_TIM9_IRQ_Handler, 2U, FAULT_INTERRUPT_RATE_TIM1)
+
   // shouldn't have interrupts here, but just in case
   disable_interrupts();
 
@@ -789,19 +834,30 @@ int main(void) {
 
   for (cnt=0;;cnt++) {
     if (power_save_status == POWER_SAVE_STATUS_DISABLED) {
-      int div_mode = ((usb_power_mode == USB_POWER_DCP) ? 4 : 1);
+      #ifdef DEBUG_FAULTS
+      if(fault_status == FAULT_STATUS_NONE){
+      #endif
+        int div_mode = ((usb_power_mode == USB_POWER_DCP) ? 4 : 1);
 
-      // useful for debugging, fade breaks = panda is overloaded
-      for (int div_mode_loop = 0; div_mode_loop < div_mode; div_mode_loop++) {
-        for (int fade = 0; fade < 1024; fade += 8) {
-          for (int i = 0; i < (128/div_mode); i++) {
-            current_board->set_led(LED_RED, 1);
-            if (fade < 512) { delay(fade); } else { delay(1024-fade); }
-            current_board->set_led(LED_RED, 0);
-            if (fade < 512) { delay(512-fade); } else { delay(fade-512); }
+        // useful for debugging, fade breaks = panda is overloaded
+        for (int div_mode_loop = 0; div_mode_loop < div_mode; div_mode_loop++) {
+          for (int fade = 0; fade < 1024; fade += 8) {
+            for (int i = 0; i < (128/div_mode); i++) {
+              current_board->set_led(LED_RED, 1);
+              if (fade < 512) { delay(fade); } else { delay(1024-fade); }
+              current_board->set_led(LED_RED, 0);
+              if (fade < 512) { delay(512-fade); } else { delay(fade-512); }
+            }
           }
         }
-      }
+      #ifdef DEBUG_FAULTS
+      } else {
+          current_board->set_led(LED_RED, 1);
+          delay(512000U);
+          current_board->set_led(LED_RED, 0);
+          delay(512000U);
+        }
+      #endif
     } else {
       __WFI();
     }

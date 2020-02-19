@@ -14,6 +14,7 @@ typedef struct {
 
 #define BUS_MAX 4U
 
+uint32_t can_rx_errs = 0;
 uint32_t can_send_errs = 0;
 uint32_t can_fwd_errs = 0;
 uint32_t gmlan_send_errs = 0;
@@ -32,6 +33,7 @@ bool can_pop(can_ring *q, CAN_FIFOMailBox_TypeDef *elem);
 
 // Ignition detected from CAN meessages
 bool ignition_can = false;
+uint32_t ignition_can_cnt = 0U;
 
 // end API
 
@@ -145,18 +147,6 @@ void can_set_speed(uint8_t can_number) {
     puts("CAN init FAILED!!!!!\n");
     puth(can_number); puts(" ");
     puth(BUS_NUM_FROM_CAN_NUM(can_number)); puts("\n");
-  }
-}
-
-void can_init(uint8_t can_number) {
-  if (can_number != 0xffU) {
-    CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(can_number);
-    can_set_speed(can_number);
-
-    llcan_init(CAN);
-
-    // in case there are queued up messages
-    process_can(can_number);
   }
 }
 
@@ -335,10 +325,11 @@ void process_can(uint8_t can_number) {
 }
 
 void ignition_can_hook(CAN_FIFOMailBox_TypeDef *to_push) {
-
   int bus = GET_BUS(to_push);
   int addr = GET_ADDR(to_push);
   int len = GET_LEN(to_push);
+
+  ignition_can_cnt = 0U;  // reset counter
 
   if (bus == 0) {
     // GM exception
@@ -355,11 +346,6 @@ void ignition_can_hook(CAN_FIFOMailBox_TypeDef *to_push) {
     if ((addr == 0x160) && (len == 5)) {
       // this message isn't all zeros when ignition is on
       ignition_can = GET_BYTES_04(to_push) != 0;
-    }
-    // VW exception
-    if ((addr == 0x3C0) && (len == 4)) {
-     // VW Terminal 15 (ignition-on) state
-     ignition_can  = (GET_BYTE(to_push, 2) & 0x2) != 0;
     }
   }
 }
@@ -396,7 +382,7 @@ void can_rx(uint8_t can_number) {
       can_send(&to_send, bus_fwd_num, true);
     }
 
-    safety_rx_hook(&to_push);
+    can_rx_errs += safety_rx_hook(&to_push) ? 0U : 1U;
     ignition_can_hook(&to_push);
 
     current_board->set_led(LED_BLUE, true);
@@ -407,17 +393,17 @@ void can_rx(uint8_t can_number) {
   }
 }
 
-void CAN1_TX_IRQHandler(void) { process_can(0); }
-void CAN1_RX0_IRQHandler(void) { can_rx(0); }
-void CAN1_SCE_IRQHandler(void) { can_sce(CAN1); }
+void CAN1_TX_IRQ_Handler(void) { process_can(0); }
+void CAN1_RX0_IRQ_Handler(void) { can_rx(0); }
+void CAN1_SCE_IRQ_Handler(void) { can_sce(CAN1); }
 
-void CAN2_TX_IRQHandler(void) { process_can(1); }
-void CAN2_RX0_IRQHandler(void) { can_rx(1); }
-void CAN2_SCE_IRQHandler(void) { can_sce(CAN2); }
+void CAN2_TX_IRQ_Handler(void) { process_can(1); }
+void CAN2_RX0_IRQ_Handler(void) { can_rx(1); }
+void CAN2_SCE_IRQ_Handler(void) { can_sce(CAN2); }
 
-void CAN3_TX_IRQHandler(void) { process_can(2); }
-void CAN3_RX0_IRQHandler(void) { can_rx(2); }
-void CAN3_SCE_IRQHandler(void) { can_sce(CAN3); }
+void CAN3_TX_IRQ_Handler(void) { process_can(2); }
+void CAN3_RX0_IRQ_Handler(void) { can_rx(2); }
+void CAN3_SCE_IRQ_Handler(void) { can_sce(CAN3); }
 
 void can_send(CAN_FIFOMailBox_TypeDef *to_push, uint8_t bus_number, bool skip_tx_hook) {
   if (skip_tx_hook || safety_tx_hook(to_push) != 0) {
@@ -437,5 +423,27 @@ void can_send(CAN_FIFOMailBox_TypeDef *to_push, uint8_t bus_number, bool skip_tx
 
 void can_set_forwarding(int from, int to) {
   can_forwarding[from] = to;
+}
+
+void can_init(uint8_t can_number) {
+  REGISTER_INTERRUPT(CAN1_TX_IRQn, CAN1_TX_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_1)
+  REGISTER_INTERRUPT(CAN1_RX0_IRQn, CAN1_RX0_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_1)
+  REGISTER_INTERRUPT(CAN1_SCE_IRQn, CAN1_SCE_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_1)
+  REGISTER_INTERRUPT(CAN2_TX_IRQn, CAN2_TX_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_2)
+  REGISTER_INTERRUPT(CAN2_RX0_IRQn, CAN2_RX0_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_2)
+  REGISTER_INTERRUPT(CAN2_SCE_IRQn, CAN2_SCE_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_2)
+  REGISTER_INTERRUPT(CAN3_TX_IRQn, CAN3_TX_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_3)
+  REGISTER_INTERRUPT(CAN3_RX0_IRQn, CAN3_RX0_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_3)
+  REGISTER_INTERRUPT(CAN3_SCE_IRQn, CAN3_SCE_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_3)
+
+  if (can_number != 0xffU) {
+    CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(can_number);
+    can_set_speed(can_number);
+
+    llcan_init(CAN);
+
+    // in case there are queued up messages
+    process_can(can_number);
+  }
 }
 
