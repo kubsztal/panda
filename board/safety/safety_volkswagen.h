@@ -94,8 +94,6 @@ static void volkswagen_mqb_init(int16_t param) {
   volkswagen_torque_msg = MSG_HCA_01;
   volkswagen_lane_msg = MSG_LDW_02;
   gen_crc_lookup_table(0x2F, volkswagen_crc8_lut_8h2f);
-
-  return;
 }
 
 static int volkswagen_mqb_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
